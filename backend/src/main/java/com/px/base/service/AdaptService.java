@@ -13,8 +13,6 @@ import com.px.base.repository.FlightRouteRepository;
 import com.px.base.repository.RouteAnchorRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -327,21 +325,4 @@ public class AdaptService {
         return routeAnchorRepository.findByAnchorIdAndStatus(anchorId, 1);
     }
 
-    public List<AdaptLog> getLogs(Long routeId) {
-        if (routeId == null) {
-            return adaptLogRepository.findAll();
-        }
-        return adaptLogRepository.findByRouteId(routeId);
-    }
-
-    public List<AdaptLog> getLogsByAnchor(Long anchorId) {
-        return adaptLogRepository.findByAnchorId(anchorId);
-    }
-
-    public Page<AdaptLog> getLogsPage(Long routeId, Pageable pageable) {
-        if (routeId != null) {
-            return adaptLogRepository.findByRouteId(routeId, pageable);
-        }
-        return adaptLogRepository.findAll(pageable);
-    }
 }

@@ -342,7 +342,38 @@ anchor (1) ──── (*) route_anchor ──── (*) flight_route (1)
 | /api/adapt/unbind | POST | AdaptController | 解绑锚点 |
 | /api/adapt/check | GET | AdaptController | 校验单个锚点是否适配航线 |
 | /api/adapt/recheck/{routeId} | POST | AdaptController | 重新校验航线所有锚点 |
-| /api/adapt/logs | GET | AdaptController | 查询适配调整流水 |
+| /api/adapt/logs | GET | AdaptController | 查询适配流水分页快照（routeId/pageNo/pageSize） |
+| /api/adapt/logs/export | GET | AdaptController | 按当前筛选在服务端导出排序后的流水快照文件 |
+
+#### 5.3.1 流水读取与导出：同一份可复核快照
+
+航线筛选、全量查询、分页查询、导出共用 `AdaptLogSnapshotService` 一条口径：
+
+1. **稳定排序**：服务端固定 `create_time DESC, id DESC`。先按发生时间倒序，同一时刻用自增ID打破并列——拒绝记录刷新后不再前后跳动，现场可按时间还原一次适配调整。仓储不再暴露无排序的 `findByRouteId/findAll(Pageable)` 旧入口。
+2. **同一查询时刻**：每次读取/导出先查 `max(id)` 冻结快照高水位 `snapshotMaxId`，再只取 `id <= snapshotMaxId` 的记录。`total`、页码、记录顺序、导出内容都对应该时刻；查询或导出期间新写入的绑定/拒绝流水不会混入，因此总数与行数必然一致。
+3. **导出由服务端生成**：`GET /api/adapt/logs/export?routeId=` 接收当前筛选条件，在服务端冻结快照并产出 JSON 文件，前端不得拿页面旧数组拼 JSON。文件名与内容都带筛选航线、查询时刻、记录总数，形如 `adapt-logs_route-R-STRONG_20260923-153012_total-7.json`；全部航线为 `route-ALL`。
+4. **空结果 vs 请求失败**：筛选有效但无命中时，读取返回 HTTP 200、`total=0`，导出仍正常下载，内容 `resultState=NO_MATCH`、`total=0`；筛选不存在的航线返回 HTTP 400。二者明确区分，不允许把请求失败伪装成“没有数据”。
+
+分页响应体（`AdaptLogPageDTO`）：
+
+```json
+{
+  "filter": { "routeId": 3 },
+  "routeCode": "R-STRONG",
+  "snapshotMaxId": 128,
+  "snapshotTime": "2026-09-23T15:30:12",
+  "total": 7,
+  "pageNo": 1,
+  "pageSize": 20,
+  "totalPages": 1,
+  "sort": "create_time DESC, id DESC",
+  "records": [ { "id": 128, "routeCode": "R-STRONG", "operationType": "REJECT" } ]
+}
+```
+
+导出文件体（`AdaptLogExportDTO`）：顶层即文件内容（不是 `ResponseDTO` 包装），含 `resultState`（`OK`/`NO_MATCH`）、`meta`（exportedAt/snapshotTime/snapshotMaxId/total/sort/note）、`filter`（routeId/routeCode/description）与 `records`。
+
+前端并发语义（`composables/latestRequestGuard.ts`）：读取与导出各有单调递增序号，快速切换航线、翻页、刷新或连续点击导出时，旧响应（含失败返回）序号落后一律丢弃，只允许最后一次确认的筛选更新页面/触发下载。这是数据正确性闸口，不依赖按钮 disabled。验收见 `AdaptLogSnapshotIntegrationTest`（后端 H2+MockMvc）与 `latestRequestGuard.test.ts`（前端）。
 
 #### 请求/响应示例
 
@@ -497,9 +528,13 @@ ZREM anchor:wind:max {anchor_code}
 
 | 功能区域 | 说明 |
 |----------|------|
-| 筛选条件 | 航线、锚点、操作类型、时间范围 |
-| 流水列表 | 展示操作类型、航线、锚点、原因、时间 |
-| 导出按钮 | 导出流水记录 |
+| 筛选条件 | 航线（含“全部航线”），切换即重置到第一页并重新取服务端快照 |
+| 流水列表 | 服务端固定按发生时间、自增编号倒序；展示操作类型、航线、锚点、原因、时间，带加载态 |
+| 分页 | 服务端分页，总数/页码/记录顺序对应同一快照时刻；越界页码由服务端收敛到最后一页 |
+| 快照信息 | 页面显示查询时刻与快照高水位ID，可与导出文件交叉复核 |
+| 并发防护 | 切换航线/翻页/刷新乱序返回时，旧响应一律丢弃，只显示最后一次筛选结果 |
+| 导出按钮 | 携带当前筛选请求服务端生成快照文件；连续点击只下载最后一次确认的结果；文件名与内容含筛选航线、查询时刻、总数 |
+| 空态/错误 | 空命中提示“没有命中（并非请求失败）”；请求失败显示错误与重试，二者不混淆 |
 
 ---
 

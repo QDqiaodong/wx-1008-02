@@ -22,13 +22,25 @@ request.interceptors.request.use((config) => {
 
 request.interceptors.response.use(
   (response: AxiosResponse) => {
+    // 文件下载（导出）：直接放行完整响应，由调用方读取 header 与 Blob
+    if (response.config.responseType === 'blob') {
+      return response
+    }
     const res = response.data
     if (res.code !== 200) {
       return Promise.reject(new Error(res.message || 'Error'))
     }
     return res.data
   },
-  (error: AxiosError) => {
+  async (error: AxiosError) => {
+    // 导出失败时后端返回 JSON 错误体（在 Blob 里），解析出来给统一错误提示
+    const errData = error.response?.data
+    if (errData instanceof Blob && errData.type.includes('application/json')) {
+      try {
+        const parsed = JSON.parse(await errData.text()) as { message?: string }
+        return Promise.reject(new Error(parsed.message || '导出失败'))
+      } catch { /* fall through */ }
+    }
     const res = error.response?.data as { message?: string } | undefined
     if (res?.message) {
       return Promise.reject(new Error(res.message))
@@ -121,6 +133,41 @@ export interface AdaptLog {
   createTime: string
 }
 
+/**
+ * 服务端返回的流水快照：total / pageNo / records 与 snapshotTime、snapshotMaxId
+ * 对应同一个查询时刻。前端只负责展示，不得自行 sort、不得拿旧数组导出。
+ */
+export interface AdaptLogSnapshot {
+  filter: { routeId: number | null }
+  routeCode: string | null
+  snapshotMaxId: number
+  snapshotTime: string
+  total: number
+  pageNo: number
+  pageSize: number
+  totalPages: number
+  sort: string
+  records: AdaptLog[]
+}
+
+/** 导出文件服务端元信息（文件内容内，可离线复核） */
+export interface AdaptLogExportMeta {
+  exportedAt: string
+  snapshotTime: string
+  snapshotMaxId: number
+  total: number
+  sort: string
+  note: string
+}
+
+export interface AdaptLogExportFile {
+  /** OK-有命中；NO_MATCH-筛选有效但没有命中（与请求失败明确区分） */
+  resultState: 'OK' | 'NO_MATCH'
+  meta: AdaptLogExportMeta
+  filter: { routeId: number | null; routeCode: string; description: string }
+  records: AdaptLog[]
+}
+
 export interface GroupAnchorResult {
   anchorId: number
   anchorCode: string
@@ -187,11 +234,27 @@ export const adaptApi = {
   unbind: (routeId: number, anchorId: number) => post<AdaptResult>('/adapt/unbind', { routeId, anchorId }),
   check: (routeId: number, anchorId: number) => get<AdaptResult>(`/adapt/check?routeId=${routeId}&anchorId=${anchorId}`),
   recheck: (routeId: number) => post<AdaptResult>(`/adapt/recheck/${routeId}`),
-  logs: (routeId?: number, anchorId?: number) => {
-    let url = '/adapt/logs'
-    if (routeId) url += `?routeId=${routeId}`
-    else if (anchorId) url += `?anchorId=${anchorId}`
-    return get<AdaptLog[]>(url)
+  /**
+   * 流水分页快照。页码/总数/记录顺序由服务端在同一查询时刻冻结，
+   * 前端不做排序。返回值带 snapshotTime / snapshotMaxId 供复核。
+   */
+  logsPage: (params: { routeId?: number; pageNo: number; pageSize: number }) => {
+    const qs = new URLSearchParams()
+    if (params.routeId) qs.set('routeId', String(params.routeId))
+    qs.set('pageNo', String(params.pageNo))
+    qs.set('pageSize', String(params.pageSize))
+    return get<AdaptLogSnapshot>(`/adapt/logs?${qs.toString()}`)
+  },
+  /**
+   * 服务端导出：必须传当前确认的筛选条件，由后端冻结快照并生成排序后的文件。
+   * 返回完整响应（含 Content-Disposition 文件名与 Blob），前端不再拼旧数组。
+   */
+  exportLogs: (routeId?: number) => {
+    const qs = new URLSearchParams()
+    if (routeId) qs.set('routeId', String(routeId))
+    const suffix = qs.toString()
+    return request.get(`/adapt/logs/export${suffix ? `?${suffix}` : ''}`, { responseType: 'blob' })
+      .then((res) => res as unknown as AxiosResponse<Blob>)
   },
   bound: (routeId: number) => get<RouteAnchor[]>(`/adapt/bound/${routeId}`)
 }
