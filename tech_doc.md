@@ -342,7 +342,8 @@ anchor (1) ──── (*) route_anchor ──── (*) flight_route (1)
 | /api/adapt/unbind | POST | AdaptController | 解绑锚点 |
 | /api/adapt/check | GET | AdaptController | 校验单个锚点是否适配航线 |
 | /api/adapt/recheck/{routeId} | POST | AdaptController | 重新校验航线所有锚点 |
-| /api/adapt/logs | GET | AdaptController | 查询适配调整流水 |
+| /api/adapt/logs | GET | AdaptController | 分页查询适配调整流水（稳定排序快照，参数 routeId/page/size） |
+| /api/adapt/logs/export | GET | AdaptController | 服务端导出排序后整份快照 JSON（参数 routeId，文件名/内容带筛选、查询时刻、总数） |
 
 #### 请求/响应示例
 
@@ -385,27 +386,55 @@ anchor (1) ──── (*) route_anchor ──── (*) flight_route (1)
 }
 ```
 
-**GET /api/adapt/logs?routeId=1**
+**GET /api/adapt/logs?routeId=1&page=1&size=20**
+
+读取与导出口径一致：航线筛选、全量查询、分页共用同一条 JPQL，服务端强制稳定排序
+`create_time DESC, id DESC`（同一时刻由自增编号兜底，拒绝记录刷新后不再跳动）。
+计数与取数在 `REPEATABLE_READ` 只读事务内执行，`total/page/totalPages/records`
+对应同一个查询时刻；查询期间新增流水不会让总数与行数错位。
+空结果语义：筛选存在但无命中 → 200 且 `total=0`；航线不存在 → 400（请求失败）。
 
 响应体：
 ```json
 {
     "code": 200,
     "message": "success",
-    "data": [
-        {
-            "id": 1,
-            "routeCode": "ROUTE-001",
-            "anchorCode": "ANCHOR-001",
-            "operationType": "BIND",
-            "beforeWindSpeed": null,
-            "afterWindSpeed": 3.50,
-            "reason": "手动绑定",
-            "createTime": "2024-01-01 10:00:00"
-        }
-    ]
+    "data": {
+        "routeId": 1,
+        "routeCode": "ROUTE-001",
+        "anchorId": null,
+        "queryTime": "2026-09-23 10:00:00",
+        "total": 1,
+        "page": 1,
+        "size": 20,
+        "totalPages": 1,
+        "sort": "createTime:desc,id:desc",
+        "records": [
+            {
+                "id": 1,
+                "routeCode": "ROUTE-001",
+                "anchorCode": "ANCHOR-001",
+                "operationType": "BIND",
+                "beforeWindSpeed": null,
+                "afterWindSpeed": 3.50,
+                "reason": "手动绑定",
+                "createTime": "2024-01-01 10:00:00"
+            }
+        ]
+    }
 }
 ```
+
+**GET /api/adapt/logs/export?routeId=1**
+
+导出在服务端按与读取完全一致的筛选与稳定排序生成整份快照 JSON，前端不拿页面数组
+自行拼装；`Content-Disposition` 文件名（中文走 RFC 5987 `filename*`）与文件体都带
+筛选航线、查询时刻、记录总数。`total=0` 也会下载一份“没有命中”的快照；非法筛选
+返回 4xx，不下载文件。
+
+前端流水页用单调递增的读取序号拦截过期响应（快速切换航线/翻页/刷新只允许最后一次
+结果更新页面），导出用 AbortController 取消上一次在途请求，保证下载对应最后一次
+确认的筛选；这些正确性由服务端口径保证，不依赖按钮禁用。
 
 ---
 
@@ -497,9 +526,10 @@ ZREM anchor:wind:max {anchor_code}
 
 | 功能区域 | 说明 |
 |----------|------|
-| 筛选条件 | 航线、锚点、操作类型、时间范围 |
-| 流水列表 | 展示操作类型、航线、锚点、原因、时间 |
-| 导出按钮 | 导出流水记录 |
+| 筛选条件 | 航线（全部/单航线）；切换航线回到第 1 页 |
+| 流水列表 | 服务端稳定排序（发生时间倒序+自增编号倒序）的分页快照；空命中与请求失败明确区分 |
+| 分页 | 服务端返回 total/page/totalPages，页面、分页、导出同一查询口径 |
+| 导出按钮 | 携带当前筛选由服务端生成快照 JSON；文件名与内容含筛选航线、查询时刻、总数；连续点击只下载最后一次 |
 
 ---
 

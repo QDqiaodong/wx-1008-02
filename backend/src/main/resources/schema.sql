@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS adapt_log (
     INDEX idx_route_id (route_id),
     INDEX idx_anchor_id (anchor_id),
     INDEX idx_operation_type (operation_type),
-    INDEX idx_create_time (create_time)
+    INDEX idx_create_time_id (create_time, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='适配调整流水表';
 
 -- ==================== 地勤资质与开航值守 ====================

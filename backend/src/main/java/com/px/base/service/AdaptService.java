@@ -1,5 +1,6 @@
 package com.px.base.service;
 
+import com.px.base.dto.AdaptLogSnapshotDTO;
 import com.px.base.dto.AdaptResultDTO;
 import com.px.base.entity.AdaptLog;
 import com.px.base.entity.Anchor;
@@ -14,8 +15,11 @@ import com.px.base.repository.RouteAnchorRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
@@ -319,6 +323,22 @@ public class AdaptService {
         return anchor.getMaxWindSpeed().compareTo(route.getWindSpeed()) >= 0;
     }
 
+    /**
+     * 流水唯一稳定排序：先按发生时间倒序，再按自增编号倒序兜底。
+     * 航线筛选、全量查询、分页查询、导出全部走这一条排序，不允许前端自行 sort。
+     */
+    public static final String STABLE_SORT = "createTime:desc,id:desc";
+
+    /**
+     * 校验筛选航线：传了不存在的航线ID属于请求失败（400），
+     * 不能静默成空列表，否则“没有命中”与“请求失败”无法区分。
+     */
+    public void validateRouteFilter(Long routeId) {
+        if (routeId != null && !flightRouteRepository.existsById(routeId)) {
+            throw new IllegalArgumentException("筛选航线不存在: " + routeId);
+        }
+    }
+
     public List<RouteAnchor> getBoundAnchors(Long routeId) {
         return routeAnchorRepository.findByRouteIdAndStatus(routeId, 1);
     }
@@ -327,21 +347,73 @@ public class AdaptService {
         return routeAnchorRepository.findByAnchorIdAndStatus(anchorId, 1);
     }
 
-    public List<AdaptLog> getLogs(Long routeId) {
-        if (routeId == null) {
-            return adaptLogRepository.findAll();
-        }
-        return adaptLogRepository.findByRouteId(routeId);
+    /**
+     * 分页读取流水快照。
+     *
+     * <p>用 REPEATABLE_READ 显式固定一个事务视图：count 与分页数据虽是两条 SQL，
+     * 但共享同一个事务快照——查询期间新增一条绑定/拒绝流水，总数、页码、记录顺序
+     * 仍对应同一个查询时刻，不会出现 total 与本页行数对不上。
+     * （MySQL/InnoDB 与验收用 H2 都支持该隔离级别。）
+     *
+     * @param routeId 航线ID，null 表示全部航线
+     * @param page    页码，从 1 起
+     * @param size    每页条数
+     */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public AdaptLogSnapshotDTO getLogsSnapshot(Long routeId, int page, int size) {
+        Pageable pageable = PageRequest.of(Math.max(page - 1, 0), clampPageSize(size),
+                Sort.by(Sort.Order.desc("createTime"), Sort.Order.desc("id")));
+        Page<AdaptLog> result = adaptLogRepository.queryPage(routeId, pageable);
+
+        FlightRoute route = routeId == null ? null
+                : flightRouteRepository.findById(routeId).orElse(null);
+
+        return AdaptLogSnapshotDTO.builder()
+                .routeId(routeId)
+                .routeCode(route != null ? route.getRouteCode() : "ALL")
+                .queryTime(LocalDateTime.now())
+                .total(result.getTotalElements())
+                .page(page)
+                .size(result.getSize())
+                .totalPages(result.getTotalPages())
+                .sort(STABLE_SORT)
+                .records(result.getContent())
+                .build();
     }
 
-    public List<AdaptLog> getLogsByAnchor(Long anchorId) {
-        return adaptLogRepository.findByAnchorId(anchorId);
+    /**
+     * 导出用全量快照。与分页读取同一筛选口径、同一稳定排序；
+     * REPEATABLE_READ 事务视图内计数与取数共享同一快照，导出期间新增流水
+     * 也不会出现“总数与下载行数对不上”。
+     */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public AdaptLogSnapshotDTO getExportSnapshot(Long routeId) {
+        LocalDateTime queryTime = LocalDateTime.now();
+        Pageable pageable = PageRequest.of(0, Integer.MAX_VALUE,
+                Sort.by(Sort.Order.desc("createTime"), Sort.Order.desc("id")));
+        Page<AdaptLog> result = adaptLogRepository.queryPage(routeId, pageable);
+        List<AdaptLog> records = result.getContent();
+
+        FlightRoute route = routeId == null ? null
+                : flightRouteRepository.findById(routeId).orElse(null);
+
+        return AdaptLogSnapshotDTO.builder()
+                .routeId(routeId)
+                .routeCode(route != null ? route.getRouteCode() : "ALL")
+                .queryTime(queryTime)
+                .total(result.getTotalElements())
+                .page(1)
+                .size(records.size())
+                .totalPages(records.isEmpty() ? 0 : 1)
+                .sort(STABLE_SORT)
+                .records(records)
+                .build();
     }
 
-    public Page<AdaptLog> getLogsPage(Long routeId, Pageable pageable) {
-        if (routeId != null) {
-            return adaptLogRepository.findByRouteId(routeId, pageable);
+    private int clampPageSize(int size) {
+        if (size <= 0) {
+            return 20;
         }
-        return adaptLogRepository.findAll(pageable);
+        return Math.min(size, 200);
     }
 }

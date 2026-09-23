@@ -42,6 +42,27 @@ const post = <T>(url: string, data?: unknown) => request.post<T>(url, data) as u
 const put = <T>(url: string, data?: unknown) => request.put<T>(url, data) as unknown as Promise<T>
 const del = (url: string) => request.delete(url) as unknown as Promise<void>
 
+/**
+ * 导出等二进制下载专用实例：不复用 JSON 拦截器（否则 Blob 会被当成
+ * { code,data } 解包）。仍带当前操作人头。错误响应体是 JSON，需要把 Blob
+ * 读回文本解析出 message，保证“请求失败”与“没有命中(200,total=0)”可区分。
+ */
+const rawRequest = axios.create({
+  baseURL: '/api',
+  timeout: 60000,
+  responseType: 'blob'
+})
+rawRequest.interceptors.request.use((config) => {
+  try {
+    const raw = localStorage.getItem('px-current-staff-id')
+    if (raw) {
+      config.headers = config.headers ?? {}
+      config.headers['X-Staff-Id'] = raw
+    }
+  } catch { /* ignore */ }
+  return config
+})
+
 export interface Anchor {
   id: number
   anchorCode: string
@@ -121,6 +142,29 @@ export interface AdaptLog {
   createTime: string
 }
 
+export interface AdaptLogSnapshot {
+  /** 筛选航线ID；null 表示全部航线 */
+  routeId: number | null
+  /** 筛选航线编号；全部航线为 "ALL" */
+  routeCode: string
+  anchorId: number | null
+  /** 服务端查询时刻，同一快照内总数/页码/记录对应这一时刻 */
+  queryTime: string
+  /** 命中总数；0 = 没有命中（请求成功），与请求失败(4xx/5xx)严格区分 */
+  total: number
+  page: number
+  size: number
+  totalPages: number
+  sort: string
+  records: AdaptLog[]
+}
+
+export interface AdaptLogExportResult {
+  blob: Blob
+  /** 服务端 Content-Disposition 给出的文件名，内含筛选航线/查询时间/总数 */
+  filename: string
+}
+
 export interface GroupAnchorResult {
   anchorId: number
   anchorCode: string
@@ -187,13 +231,60 @@ export const adaptApi = {
   unbind: (routeId: number, anchorId: number) => post<AdaptResult>('/adapt/unbind', { routeId, anchorId }),
   check: (routeId: number, anchorId: number) => get<AdaptResult>(`/adapt/check?routeId=${routeId}&anchorId=${anchorId}`),
   recheck: (routeId: number) => post<AdaptResult>(`/adapt/recheck/${routeId}`),
-  logs: (routeId?: number, anchorId?: number) => {
-    let url = '/adapt/logs'
-    if (routeId) url += `?routeId=${routeId}`
-    else if (anchorId) url += `?anchorId=${anchorId}`
-    return get<AdaptLog[]>(url)
+  /**
+   * 流水唯一读取口径：服务端按 createTime desc,id desc 稳定排序并返回
+   * 同一查询时刻的快照（total/page/records）。不传 routeId = 全部航线。
+   */
+  logsSnapshot: (routeId?: number, page = 1, size = 20) => {
+    const params = new URLSearchParams()
+    if (routeId) params.set('routeId', String(routeId))
+    params.set('page', String(page))
+    params.set('size', String(size))
+    return get<AdaptLogSnapshot>(`/adapt/logs?${params.toString()}`)
+  },
+  /**
+   * 服务端导出：把当前筛选条件发给后端，后端按与读取一致的排序生成整份快照 JSON；
+   * 前端不再拿页面旧数组拼 JSON。返回二进制内容与服务端文件名。
+   * 支持外部 AbortSignal：连续点击导出/切换航线时只认最后一次。
+   */
+  exportLogs: async (routeId: number | undefined, signal?: AbortSignal): Promise<AdaptLogExportResult> => {
+    const params = new URLSearchParams()
+    if (routeId) params.set('routeId', String(routeId))
+    const qs = params.toString()
+    let resp
+    try {
+      resp = await rawRequest.get(`/adapt/logs/export${qs ? `?${qs}` : ''}`, { signal })
+    } catch (err) {
+      // 错误响应体是 JSON Blob，读回文本取出后端 message，让“请求失败”可被明确提示
+      const axiosErr = err as { response?: { data?: Blob } }
+      const data = axiosErr.response?.data
+      if (data instanceof Blob && data.type.includes('json')) {
+        try {
+          const body = JSON.parse(await data.text()) as { message?: string }
+          if (body.message) throw new Error(body.message)
+        } catch (parsed) {
+          if (parsed instanceof Error && parsed.message) throw parsed
+        }
+      }
+      throw err
+    }
+    const disposition = (resp.headers['content-disposition'] as string | undefined) ?? ''
+    const filename = parseFilename(disposition)
+    return { blob: resp.data as Blob, filename }
   },
   bound: (routeId: number) => get<RouteAnchor[]>(`/adapt/bound/${routeId}`)
+}
+
+/** 优先取 filename*=UTF-8''（中文文件名），其次取 ASCII filename。 */
+function parseFilename(disposition: string): string {
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(disposition)
+  if (star) {
+    try {
+      return decodeURIComponent(star[1])
+    } catch { /* fall through */ }
+  }
+  const plain = /filename="?([^";]+)"?/i.exec(disposition)
+  return plain ? plain[1] : `adapt-logs-${new Date().toISOString().slice(0, 10)}.json`
 }
 
 export const groupBindingApi = {
